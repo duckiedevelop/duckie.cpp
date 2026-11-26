@@ -789,7 +789,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
     [GGML_TYPE_TURBO3_0] = {
-        .type_name                = "turbo3",
+        .type_name                = "duckie3",
         .blck_size                = QK_TURBO3,
         .type_size                = sizeof(block_turbo3_0),
         .is_quantized             = true,
@@ -797,7 +797,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_0_ref,
     },
     [GGML_TYPE_TURBO4_0] = {
-        .type_name                = "turbo4",
+        .type_name                = "duckie4",
         .blck_size                = QK_TURBO4,
         .type_size                = sizeof(block_turbo4_0),
         .is_quantized             = true,
@@ -805,7 +805,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
     },
     [GGML_TYPE_TURBO6_0] = {
-        .type_name                = "turbo6",
+        .type_name                = "duckie6",
         .blck_size                = QK_TURBO6,
         .type_size                = sizeof(block_turbo6_0),
         .is_quantized             = true,
@@ -813,7 +813,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo6_0_ref,
     },
     [GGML_TYPE_TURBO5_0] = {
-        .type_name                = "turbo5",
+        .type_name                = "duckie5",
         .blck_size                = QK_TURBO5,
         .type_size                = sizeof(block_turbo5_0),
         .is_quantized             = true,
@@ -821,7 +821,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo5_0_ref,
     },
     [GGML_TYPE_TURBO2_0] = {
-        .type_name                = "turbo2",
+        .type_name                = "duckie2",
         .blck_size                = QK_TURBO2,
         .type_size                = sizeof(block_turbo2_0),
         .is_quantized             = true,

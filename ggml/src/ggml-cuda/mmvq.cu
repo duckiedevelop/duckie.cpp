@@ -1195,6 +1195,133 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// duckie: dedicated Q1_0 decode matvec (ncols_dst == 1, plain 2D weights).
+// Each warp owns DUCKIE_Q1_R rows over the full K and DUCKIE_Q1_W warps share a block, so far more warps stay
+// resident per SM than with the generic kernel (whose 1-warp configs hit the 24 blocks/SM limit). Every lane loads
+// one 32-element q8_1 activation chunk per step and reuses it for all of its rows.
+#ifndef DUCKIE_Q1_W
+#define DUCKIE_Q1_W 4
+#endif
+#ifndef DUCKIE_Q1_R
+#define DUCKIE_Q1_R 4
+#endif
+
+// sum_i sign(bit_i) * u_i over one 32-element chunk: qs = 2 x 16 bits, u = 8 ints of q8_1 quants
+static __device__ __forceinline__ int duckie_q1_dot32(const int16_t * qs, const int * u) {
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int q  = qs[j];
+        const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+        const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+        const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+        const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+        const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+        const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+        sumi = ggml_cuda_dp4a(__byte_perm(s0, s1, 0x5410), u[j*4 + 0], sumi);
+        sumi = ggml_cuda_dp4a(__byte_perm(s0, s1, 0x7632), u[j*4 + 1], sumi);
+        sumi = ggml_cuda_dp4a(__byte_perm(s2, s3, 0x5410), u[j*4 + 2], sumi);
+        sumi = ggml_cuda_dp4a(__byte_perm(s2, s3, 0x7632), u[j*4 + 3], sumi);
+    }
+    return sumi;
+}
+
+template <bool has_gate>
+__launch_bounds__(DUCKIE_Q1_W*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q1_0_rows(
+        const block_q1_0 * __restrict__ x, const block_q1_0 * __restrict__ gate, const block_q8_1 * __restrict__ y,
+        float * __restrict__ dst, const int nchunks, const uint32_t nrows, const uint32_t stride_row, const ggml_glu_op glu_op) {
+    constexpr int R = DUCKIE_Q1_R;
+    const int      lane = threadIdx.x;
+    const uint32_t row0 = (blockIdx.x*DUCKIE_Q1_W + threadIdx.y)*R;
+
+    ggml_cuda_pdl_sync();
+    if (row0 >= nrows) {
+        return; // whole warp, no block-level sync below
+    }
+
+    const block_q1_0 * xr[R];
+    [[maybe_unused]] const block_q1_0 * gr[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const uint32_t row = min(row0 + r, nrows - 1); // clamp the tail so we never read past the matrix
+        xr[r] = x + row*stride_row;
+        if constexpr (has_gate) {
+            gr[r] = gate + row*stride_row;
+        }
+    }
+
+    float acc[R] = {0.0f};
+    [[maybe_unused]] float accg[R] = {0.0f};
+
+    for (int c = lane; c < nchunks; c += WARP_SIZE) {
+        const block_q8_1 * b8 = y + c;
+        int u[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            u[k] = get_int_b4(b8->qs, k);
+        }
+        const float d8 = __low2float(b8->ds);
+        const int   kb = c >> 2;       // Q1_0 block (128 values)
+        const int   iq = (c & 3) * 2;  // int16 offset of this 32-value chunk inside the block
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const block_q1_0 * b = xr[r] + kb;
+            acc[r] += d8 * __half2float(b->d) * duckie_q1_dot32((const int16_t *) b->qs + iq, u);
+            if constexpr (has_gate) {
+                const block_q1_0 * g = gr[r] + kb;
+                accg[r] += d8 * __half2float(g->d) * duckie_q1_dot32((const int16_t *) g->qs + iq, u);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        acc[r] = warp_reduce_sum<WARP_SIZE>(acc[r]);
+        if constexpr (has_gate) {
+            accg[r] = warp_reduce_sum<WARP_SIZE>(accg[r]);
+        }
+    }
+
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (row0 + r >= nrows) {
+                break;
+            }
+            float result = acc[r];
+            if constexpr (has_gate) {
+                switch (glu_op) {
+                    case GGML_GLU_OP_SWIGLU:     result *= ggml_cuda_op_silu_single(accg[r]);               break;
+                    case GGML_GLU_OP_GEGLU:      result *= ggml_cuda_op_gelu_single(accg[r]);               break;
+                    case GGML_GLU_OP_SWIGLU_OAI: result  = ggml_cuda_op_swiglu_oai_single(accg[r], result); break;
+                    default:                     result *= accg[r];                                         break;
+                }
+            }
+            dst[row0 + r] = result;
+        }
+    }
+}
+
+static void mul_mat_vec_q1_0_rows_cuda(
+        const void * vx, const void * vgate, const void * vy, float * dst, const int64_t ncols, const int64_t nrows,
+        const int64_t stride_row, const ggml_glu_op glu_op, cudaStream_t stream) {
+    constexpr int rows_per_block = DUCKIE_Q1_W*DUCKIE_Q1_R;
+    const dim3 block_nums((nrows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 block_dims(WARP_SIZE, DUCKIE_Q1_W, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    const auto * x = (const block_q1_0 *) vx;
+    const auto * g = (const block_q1_0 *) vgate;
+    const auto * y = (const block_q8_1 *) vy;
+    if (vgate) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q1_0_rows<true>, launch_params,
+            x, g, y, dst, (int) (ncols/QK8_1), (uint32_t) nrows, (uint32_t) stride_row, glu_op);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q1_0_rows<false>, launch_params,
+            x, g, y, dst, (int) (ncols/QK8_1), (uint32_t) nrows, (uint32_t) stride_row, glu_op);
+    }
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, bool convrot) {
@@ -1360,6 +1487,15 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // duckie: big single-token Q1_0 matvecs go to the dedicated kernel; everything else keeps the generic path
+    if (src0->type == GGML_TYPE_Q1_0 && !ids && ncols_dst == 1 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ne01 >= 1024 && !fusion_local.x_bias && !fusion_local.gate_bias &&
+            GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ctx.device].cc)) {
+        mul_mat_vec_q1_0_rows_cuda(src0->data, fusion_local.gate, src1_q8_1, dst_d, ne00, ne01, s01,
+                                   fusion_local.glu_op, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,

@@ -598,19 +598,19 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
-    if (s == "turbo2") {
+    if (s == "duckie2") {
         return GGML_TYPE_TURBO2_0;
     }
-    if (s == "turbo3") {
+    if (s == "duckie3") {
         return GGML_TYPE_TURBO3_0;
     }
-    if (s == "turbo4") {
+    if (s == "duckie4") {
         return GGML_TYPE_TURBO4_0;
     }
-    if (s == "turbo6") {
+    if (s == "duckie6") {
         return GGML_TYPE_TURBO6_0;
     }
-    if (s == "turbo5") {
+    if (s == "duckie5") {
         return GGML_TYPE_TURBO5_0;
     }
     if (s == "tq3_1s") {

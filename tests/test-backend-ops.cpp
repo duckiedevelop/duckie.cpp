@@ -8936,6 +8936,27 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // duckie: dedicated Q1_0 decode kernel (>= 1024 rows, ragged row tail, fused gate/up + GLU)
+    for (int64_t m : {1024, 1040, 2051}) {
+        for (int64_t k : {256, 5120}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q1_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+    }
+    for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q1_0, glu_op, 1, 1040, 512, false, 1, 1, false, false, true, false, {1, 1}));
+    }
+    // duckie: decode flash attention for quantized KV (head dim 256, GQA 4/6/8, ragged KV lengths)
+    for (int64_t kv : {256, 777, 4096}) {
+        for (int64_t gqa : {4, 6, 8}) {
+            for (auto [tk, tv] : std::vector<std::pair<ggml_type, ggml_type>>{
+                    {GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0},
+                    {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_F16, GGML_TYPE_F16},
+                    {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0}}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {gqa, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tk, tv));
+            }
+        }
+    }
+
     // multi-node fusion coverage: residual epilogue, shared-quantize cache, elementwise chain, MoE reduce
     for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_TQ4_1S}) {
         for (int n : {1, 2, 4, 8}) {
@@ -11058,6 +11079,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // duckie: Bonsai-27B (qwen35, Q1_0) decode/prefill shapes. Filter with -p "q1_0" / "hsk=256" / -o GATED_DELTA_NET.
+    for (int bs : {1, 128, 256}) {
+        for (auto [m, k] : std::vector<std::pair<int, int>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {48, 5120}, {248320, 5120}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q1_0, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+        }
+    }
+    for (int kv : {4096, 32768, 65536}) {
+        for (auto [tk, tv] : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0}, {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, tk, tv));
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3));
 
     // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));

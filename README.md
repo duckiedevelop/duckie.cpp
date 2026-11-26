@@ -1,224 +1,207 @@
-# llama.cpp (TurboQuant fork)
-
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+# duckie.cpp
 
 <div align="center">
 
-<b>LLM inference in C/C++ with aggressive KV cache and weight quantization</b>
+<b>llama.cpp + TurboQuant, rebuilt around one model on one GPU:<br>
+Bonsai-27B (Qwen3.6-27B, 1-bit <code>Q1_0</code>) on an RTX 4050 Laptop (6 GB, Ada <code>sm_89</code>).</b>
+
+Faster decode, much faster attention at long context, same flags and same output.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (upstream). This tree adds the **TurboQuant** feature set on top of an upstream base: upstream changes are cherry-picked on an ongoing basis where they add benefit, rather than being merged wholesale.
-
-[manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
-
 </div>
 
-## About this fork
+duckie.cpp is a fork of [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant), which is itself
+a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Everything those projects do still works here.
+On top of that:
 
-**TurboQuant** compresses the attention KV cache far beyond the standard `q8_0`, and adds WHT-rotated and ConvRot model-weight types. The method is data-oblivious online vector quantization ([TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874)) applied with a fixed 128x128 Walsh-Hadamard rotation (`GGML_OP_TURBO_WHT`): cache vectors are rotated before quantization (which Gaussianizes their distribution) and inverse-rotated after dequantization. Head dims that are not multiples of 128 are zero-padded.
-
-Eleven fork-only GGML types (registered in `ggml/include/ggml.h`):
-
-| Type     | Enum                       | Purpose                     | Size                   | Backends            |
-|----------|----------------------------|-----------------------------|------------------------|---------------------|
-| `turbo2` | `GGML_TYPE_TURBO2_0` (43)  | KV cache only               | 2.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| `turbo3` | `GGML_TYPE_TURBO3_0` (44)  | KV cache only               | 3.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| `turbo4` | `GGML_TYPE_TURBO4_0` (47)  | KV cache only               | 4.125 bits/value       | CPU, CUDA/HIP, Metal, Vulkan, SYCL |
-| `turbo5` | `GGML_TYPE_TURBO5_0` (51)  | KV cache only               | 5.125 bits/value       | CPU, CUDA/HIP       |
-| `turbo6` | `GGML_TYPE_TURBO6_0` (52)  | KV cache only               | 6.125 bits/value       | CPU, CUDA/HIP       |
-| `TQ3_1S` | `GGML_TYPE_TQ3_1S` (45)    | model weights, WHT-rotated Lloyd-Max | 4.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
-| `TQ4_1S` | `GGML_TYPE_TQ4_1S` (46)    | model weights, WHT-rotated Lloyd-Max | 5.00 bits, block 32 | CPU, CUDA/HIP, Metal, Vulkan |
-| `TQ3_4S` | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.50 bits, block 128 | CPU, CUDA/HIP |
-| `Q8_CR`  | `GGML_TYPE_Q8_CR` (48)     | model weights, ConvRot      | 8.5 bits, group 256    | CPU, CUDA/HIP, Metal |
-| `Q5_CR`  | `GGML_TYPE_Q5_CR` (49)     | model weights, ConvRot      | 5.5 bits, group 256    | CPU, CUDA/HIP, Metal |
-| `Q6_CR`  | `GGML_TYPE_Q6_CR` (50)     | model weights, ConvRot      | 6.5625 bits, group 256 | CPU, CUDA/HIP, Metal |
-
-The turbo KV cache blocks hold 128 values each: 34, 50, 66, 82 and 98 bytes for
-`turbo2` to `turbo6`, which is where the bits/value figures above come from
-(the `static_assert`s in `ggml/src/ggml-common.h` are the authority).
-`Q8_CR` / `Q5_CR` / `Q6_CR` are
-`Q8_0` / `Q5_0` / `Q6_K` blocks holding a group of 256 weights rotated with a
-normalized Kronecker-Hadamard matrix; `mul_mat` rotates the other operand the
-same way before the dot products. Vulkan and SYCL reject them.
-
-Turbo KV cache types are **runtime-only**: they are never stored in model files. `TQ3_1S` / `TQ4_1S` / `TQ3_4S` and the `*_CR` types are first-class weight types usable in any GGUF via `llama-quantize`.
+- **The TurboQuant KV cache types are renamed** `turbo2..turbo6` → **`duckie2..duckie6`**. Same bits, same quality.
+- **A dedicated 1-bit matvec kernel** for `Q1_0` weights: token generation is **22-33% faster**.
+- **A new decode flash-attention kernel** for quantized KV caches: attention at 32k-64k context runs
+  **4-10x faster** than the stock kernels, and full-model decode at 32k context is **+52%** over stock attention.
+  Speed holds up over long agentic sessions instead of falling off a cliff.
+- **A build script tuned for the card**: `sm_89` only, native CPU, static binaries.
 
 ## Quick start
 
-```sh
-# Build from source (required for TurboQuant: upstream pre-built binaries do NOT include it)
-# This is a CPU-only build; see docs/build.md for the CUDA, HIP, Metal, Vulkan and SYCL flags
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
+Build (Windows, Visual Studio 2022 + CUDA 12.x):
 
-# Or build and run with Docker (docs/docker.md)
-# Or download a binary built from THIS repository.
-# Upstream releases (github.com/ggml-org/llama.cpp/releases) reject turbo types.
-# The ghcr.io/ggml-org/llama.cpp images in docs/docker.md are upstream builds and do too.
+```bat
+build-duckie.bat
 ```
 
-Once installed:
+Binaries land in `build\bin\`: `llama-server.exe`, `llama-cli.exe`, `llama-bench.exe`, `test-backend-ops.exe`.
+Pass extra targets as arguments, e.g. `build-duckie.bat test-turbo-quant`.
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+Run the OpenAI-compatible server:
 
-# Launch OpenAI-compatible API server with a compressed KV cache
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF -c 32768 -ngl 99 -ctk q8_0 -ctv turbo3
+```bat
+build\bin\llama-server.exe -m Bonsai-27B-Q1_0.gguf -ngl 99 -fa on -c 32768 ^
+  --cache-type-k duckie4 --cache-type-v duckie4 -b 256 -ub 128
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve`" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-</table>
+Heads-up: Bonsai shares each KV head across 6 query heads. For models like that, the inherited TurboQuant
+*auto-asymmetric* rule upgrades a `duckieN` K cache to `q8_0` to protect quality, and logs a warning when it does.
+So the command above actually runs `q8_0` K + `duckie4` V. Set `TURBO_AUTO_ASYMMETRIC=0` to keep K at `duckie4`
+and halve the K cache. To fit more context in 6 GB, drop V to `duckie3`. The weights take 3.8 GB, so every saved
+KV byte becomes context.
 
-## TurboQuant KV cache
+Benchmark it yourself:
 
-```bash
-# CLI
-llama-cli -m model.gguf -c 8192 -ngl 99 --cache-type-k q8_0 --cache-type-v turbo3
-
-# OpenAI-compatible server (same flags)
-llama-server -m model.gguf -c 32768 -ngl 99 --cache-type-k q8_0 --cache-type-v turbo3
+```bat
+build\bin\llama-bench.exe -m Bonsai-27B-Q1_0.gguf -ngl 99 -fa 1 -ctk duckie4 -ctv duckie4 -b 256 -ub 128 -p 0 -n 64 -d 0,16384,32768
 ```
 
-| Type      | Bits/value | KV cache size vs f16 K/V |
-|-----------|------------|--------------------------|
-| `turbo2`  | 2.125      | up to 7.5x smaller       |
-| `turbo3`  | 3.125      | up to 5.1x smaller       |
-| `turbo4`  | 4.125      | up to 3.9x smaller       |
-| `turbo5`  | 5.125      | up to 3.1x smaller       |
-| `turbo6`  | 6.125      | up to 2.6x smaller       |
+## duckie KV cache types
 
-Any combination of `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1` and `turbo2/3/4/5/6` for K and V is accepted by the flag parser of `llama-cli`, `llama-server`, `llama-bench` (`-ctk` / `-ctv`) and `llama-perplexity`. Which combinations actually have backend kernels is narrower and backend-dependent; [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md) has the per-backend picture. K `q8_0` + V `turbo3` is the common starting point: the KV cache drops to about 36% of f16 K/V size.
+| Type      | Was      | Bits/value | KV cache vs f16 | Use it for |
+|-----------|----------|-----------:|----------------:|------------|
+| `duckie2` | `turbo2` | 2.125      | 7.5x smaller    | maximum context, most quality loss |
+| `duckie3` | `turbo3` | 3.125      | 5.1x smaller    | the capacity sweet spot |
+| `duckie4` | `turbo4` | 4.125      | 3.9x smaller    | quality first; the default pick |
+| `duckie5` | `turbo5` | 5.125      | 3.1x smaller    | between 4 and 6 (CUDA/CPU only) |
+| `duckie6` | `turbo6` | 6.125      | 2.6x smaller    | highest fidelity (CUDA/CPU only) |
 
-Notes:
+They work everywhere the old names did: `-ctk` / `-ctv` / `--cache-type-k` / `--cache-type-v` in `llama-server`,
+`llama-cli`, `llama-bench` and `llama-perplexity`, mixed freely with `f16`, `q8_0` and friends. They need flash
+attention, which is switched on automatically. The old `turbo*` names are gone, so old scripts need the new names.
 
-- Turbo types **require flash attention**. If FA is not enabled it is turned on automatically (a warning is printed). A quantized V cache with FA explicitly disabled is an error, but a turbo V cache never reaches that check because it turns FA on first.
-- **Metal**: flash attention accepts exactly three mixed pairs: turbo K + turbo V, `q8_0` K + turbo V, and turbo K + `q8_0` V (`turbo` is `turbo2/3/4` here; `turbo5/6` have no Metal kernels). Any other mixed pair, an `f16` K cache with a turbo V cache included, trips the assert in `ggml_metal_op_flash_attn_ext` and aborts. This is the backend to keep in mind for the attention-sink note below.
-- **MLA models (DeepSeek)**: there is no separate V cache (V is a view of K), so V rotation and padding are skipped, and the K and V cache types must be identical.
-- **Attention-sink models (GPT-OSS and similar)**: even `q8_0` K changes output distributions, and lower-bit K degrades them further. Use `f16` K for these models. Validate a quantized V cache against an `f16` baseline with `llama-perplexity --kl-divergence`: short samples can stay fluent while token probabilities move.
+[docs/KV-cache-quantization.md](docs/KV-cache-quantization.md) still describes the codec under its original `turbo*`
+names (read `turbo4` as `duckie4`). The `TURBO_*` environment variables keep their names.
 
-Choosing a type:
+## Why it's fast
 
-- `turbo6`: highest-fidelity turbo option (2.6x smaller than f16), CUDA/HIP and CPU only.
-- `turbo5`: between `turbo4` and `turbo6` (3.1x), CUDA/HIP and CPU only.
-- `turbo4`: quality-first for the widely supported set (3.9x smaller than f16).
-- `turbo3`: capacity sweet spot (5.1x).
-- `turbo2`: maximum context in minimum VRAM (7.5x), most quality loss.
+Bonsai-27B is a hybrid model: 64 layers, of which 48 are Gated DeltaNet (linear attention with a fixed-size state)
+and 16 are full attention with 24 query heads sharing 4 KV heads (head dim 256). Every weight matrix is `Q1_0`:
+one sign bit per weight plus an fp16 scale per 128 weights. That leaves two places where decode time goes:
+streaming 3.8 GB of 1-bit weights per token, and, as the context grows, reading the KV cache in those 16 attention layers.
+duckie.cpp attacks both.
 
-`turbo2`/`turbo3`/`turbo4` are the portable choices; `turbo5`/`turbo6` currently run on CUDA/HIP and CPU only.
+### 1. A 1-bit matvec that runs at memory speed
 
-Full usage, per-backend support and model-specific quality notes: [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md). That doc is the source of truth for the environment knobs summarized below.
+The stock `Q1_0 × q8_1` matvec was a generic template sized for 4-bit and 8-bit weights. At decode time one
+token touches every weight exactly once, so the only thing that matters is how close the kernel gets to the
+card's ~192 GB/s. The duckie kernel (`mul_mat_vec_q1_0_rows` in
+[ggml/src/ggml-cuda/mmvq.cu](ggml/src/ggml-cuda/mmvq.cu)):
 
-## TQ weight types (TQ3_1S / TQ4_1S)
+- gives each warp 4 whole rows and 4 warps per block, so even the 5120-row projections launch enough warps to keep
+  all 20 SMs streaming;
+- has every lane stream 32 contiguous weights per step: 4 bytes of sign bits are expanded to ±1 bytes with
+  `__byte_perm` and fed into 8 `dp4a` instructions against the 8-bit activations, and the fp16 block scale is
+  applied once per block;
+- fuses the SwiGLU/GeGLU gate into the same pass (gate and up projections read together, one write), matching
+  the existing fusion path.
 
-```bash
-# Quantize a model to WHT-rotated Lloyd-Max weight types
-llama-quantize model-f16.gguf model-tq4.gguf TQ4_1S
-llama-quantize model-f16.gguf model-tq3.gguf TQ3_1S
+Result: the 248k-vocab output head went from 99 to 168 GB/s, and full-model token generation from 23.9 to
+29-32 tokens/s (it varies with how hot the laptop is running).
+
+### 2. Decode flash attention built for quantized KV
+
+During decode there is one query token per sequence, and the stock kernels handled that case poorly for
+TurboQuant caches. The vector kernel re-read and re-dequantized every K/V row once per query head (6x redundant
+work at GQA 6) and looked codebook entries up in `__constant__` memory with divergent indices, which serializes.
+The tensor-core path dequantized synchronously and could not overlap loads with math. Attention cost grew so fast
+that at 32k context it was the biggest thing in the token.
+
+The duckie kernel ([ggml/src/ggml-cuda/fattn-duckie.cu](ggml/src/ggml-cuda/fattn-duckie.cu)):
+
+- **Packs the GQA group.** Each warp handles one KV head and all 6 query heads that share it, so every K/V byte is
+  read and dequantized exactly once.
+- **Splits the sequence (flash-decoding).** The KV range is cut into equal per-warp slices, sized from the measured
+  occupancy so the grid is exactly one full wave of resident blocks. A small combine kernel merges the partial
+  softmax results.
+- **Keeps codebooks in shared memory.** The 16 `duckie4` / 8 `duckie3` centroids sit in shared memory, where
+  divergent lookups don't bank-conflict, instead of serialized constant-cache reads.
+- **Reduces with a transpose.** Each lane owns 8 of the 256 dims. Dot products for 4 positions × 6 heads are summed
+  across the warp with a transpose-reduce: 27 shuffles instead of 120.
+- **Runs an online softmax in the log2 domain** (scale and `log2(e)` folded into Q once), in fp32 throughout, so the
+  numbers match the reference.
+- **Tunes occupancy.** Register use is capped at 168 per thread with zero spills, which fits 3 blocks per SM instead
+  of 2.
+
+It handles `duckie3`, `duckie4`, `q8_0` and `f16` caches in any K/V mix at head dim 256 and GQA ratios 4, 6 and 8.
+Anything else (prompt processing, other head sizes, f16+f16 caches, non-NVIDIA GPUs) goes to the stock kernels.
+
+### 3. Long sessions
+
+Long-horizon agent work means huge contexts that get reused turn after turn. With the duckie kernel, attention cost
+per token grows far more slowly with context: at 32k tokens deep, decode still runs at ~88% of its short-context
+speed (stock: ~56%; see below).
+For a hybrid model the server also keeps context checkpoints of the DeltaNet state (up to 32 per slot, at least
+8192 tokens apart), so a follow-up turn reuses the cached prefix instead of re-reading the whole conversation.
+These defaults were already good for this model and are unchanged.
+
+## Benchmarks
+
+RTX 4050 Laptop GPU (6 GB), Bonsai-27B `Q1_0`, `-ngl 99 -fa 1 -b 256 -ub 128`.
+
+**Full model, token generation (tokens/s), by context depth:**
+
+| Context depth | Stock attention (`GGML_DUCKIE_FA=0`) | duckie attention | Gain |
+|--------------:|-------------------------------------:|-----------------:|-----:|
+| 0             | 30.2                                 | 29.2             | same (short context uses the stock path) |
+| 16k           | 21.7                                 | **28.2**         | +30% |
+| 32k           | 16.8                                 | **25.6**         | +52% |
+
+KV cache `q8_0` / `duckie4`; `duckie4` / `duckie4` gives the same numbers on this model (see the auto-asymmetric
+note above). Both columns include the 1-bit matvec kernel. The TurboQuant fork as cloned ran at **23.9 tokens/s**
+at depth 0 with the same settings. At 32k context, duckie.cpp keeps ~88% of its short-context speed. With the stock
+attention kernels it keeps ~56%.
+
+**One attention layer at decode** (24 query heads / 4 KV heads, head dim 256; `test-backend-ops perf`, µs per call, lower is better):
+
+| KV cache (K / V)    | Context | Stock kernels | duckie kernel | Speedup |
+|---------------------|--------:|--------------:|--------------:|--------:|
+| `q8_0` / `duckie4`  | 32k     | 1811          | ~410-480      | ~4x     |
+| `duckie4` / `duckie3` | 64k   | 8344          | ~820          | ~10x    |
+
+Laptop GPUs boost and throttle, so expect ±10-20% run-to-run noise on any single number.
+
+## Knobs
+
+| Variable          | Default | Effect |
+|-------------------|---------|--------|
+| `GGML_DUCKIE_FA`  | on      | `0` turns off the duckie decode attention kernel (falls back to the stock kernels; handy for A/B checks) |
+| `TURBO_AUTO_ASYMMETRIC` | `1` | `0` keeps a `duckieN` K cache as requested instead of upgrading it to `q8_0` on GQA ≥ 6 models |
+
+Everything else inherited from TurboQuant still applies (`TURBO_LAYER_ADAPTIVE`, `TURBO_SPARSE_V`,
+`GGML_CUDA_FUSE_CHAIN`, ...); see [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md).
+
+## Correctness
+
+Every new kernel is checked against the CPU reference with `test-backend-ops`:
+
+- Flash attention, head dim 256, all types, masks, GQA ratios and batch sizes: **796/796**
+- `Q1_0` matmul: **51/51**; fused `Q1_0` gate/up + GLU: **32/32**
+- `test-turbo-quant` and `test-quantize-fns`: clean
+
+```bat
+build\bin\test-backend-ops.exe -b CUDA0 -o FLASH_ATTN_EXT -p "hsk=256,hsv=256"
+build\bin\test-backend-ops.exe -b CUDA0 -o MUL_MAT -p "type_a=q1_0"
 ```
 
-`TQ3_1S` (4.00 bpw) and `TQ4_1S` (5.00 bpw) are supported on CPU, CUDA/HIP (warp-cooperative `mmvq` with fused `dp4a`), Metal and Vulkan, and work in `llama-cli`, `llama-server`, `llama-bench` and `llama-perplexity`. ggml-sycl has no TQ kernels, and its generic dequantize path leaves the weights in the WHT-rotated domain, so TQ models are not supported on SYCL.
+## Scope and limits
 
-`TQ3_4S` (3.50 bpw) is `TQ3_1S` with four 32-value sub-blocks sharing one fp16 scale and 6-bit sub-scales. It is a `llama-quantize` target (`llama-quantize model-f16.gguf model-tq3_4s.gguf TQ3_4S`) with CPU and CUDA/HIP kernels (fused decode, and opt-in int8 MMQ prefill on CDNA, RDNA2 and RDNA3 with `GGML_TQ_MMQ=1`). Metal, Vulkan and SYCL do not claim its ops, so they run on the CPU.
+- **Tuned for one setup.** `build-duckie.bat` compiles for `sm_89` (RTX 40-series) only. For another NVIDIA card,
+  change `CMAKE_CUDA_ARCHITECTURES` in the script and delete `build\` to reconfigure. The kernels are plain CUDA and
+  should run on any recent NVIDIA GPU, but they were only measured here.
+- **NVIDIA only for the new kernels.** AMD, Metal, Vulkan, SYCL and CPU builds still compile and run, on the stock
+  TurboQuant paths.
+- **Decode is the focus.** Prompt processing uses the stock kernels and runs at the same speed as TurboQuant.
+- Everything else from upstream TurboQuant (TQ weight types, ConvRot types, other backends) is untouched. See
+  [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md) and [docs/build.md](docs/build.md).
 
-On CUDA, `TQ4_1S` weights are converted to `q8_0` at load time by default (best prefill speed). Set `GGML_TQ_NATIVE=1` to keep them native: decode is about 30% faster and weight VRAM drops about 1.7x, but prefill is about 2x slower. Pick it for decode-heavy serving; keep the default for prefill-heavy or mixed workloads.
+## Credits and license
 
-## Backend support (TurboQuant features)
+MIT, like the projects it builds on. Built on the work of the
+[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) contributors and
+[TheTom's TurboQuant fork](https://github.com/TheTom/llama-cpp-turboquant), which implements
+[TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874).
+Fork development rules and test gates: [AGENTS.md](AGENTS.md).
 
-| Feature                     | CUDA/HIP | Metal | Vulkan | SYCL | CPU | WebGPU |
-|-----------------------------|----------|-------|--------|------|-----|--------|
-| `turbo2/3/4` KV cache       | yes      | yes   | yes    | yes  | yes | no     |
-| `turbo5/6` KV cache         | yes      | no    | no     | no   | yes | no     |
-| Flash attention (turbo2/3/4) | yes     | yes   | yes    | yes  | yes | no     |
-| Flash attention (turbo5/6)  | yes      | no    | no     | no   | yes | no     |
-| `TQ3_1S` / `TQ4_1S` weights | yes      | yes   | yes    | no   | yes | no     |
-| `TQ3_4S` weights            | yes      | no    | no     | no   | yes | no     |
-| `Q8_CR` / `Q5_CR` / `Q6_CR` weights | yes | yes | no    | no   | yes | no     |
-| `GGML_TQ_NATIVE`            | yes      | n/a   | n/a    | n/a  | n/a | n/a    |
-
-## Environment knobs
-
-| Variable                                  | Default | Effect |
-|-------------------------------------------|---------|--------|
-| `TURBO_LAYER_ADAPTIVE`                    | auto    | Layer-adaptive KV precision; mode 7 (Boundary V) auto-enables for `turbo2` V on models with 8+ layers |
-| `TURBO_AUTO_ASYMMETRIC`                   | `1`     | Auto-select asymmetric K/V types for large-GQA models (`0` disables) |
-| `TURBO_SPARSE_V`                          | `1`     | Sparse-V dequant skip in flash attention, Metal and `turbo3` V only (`0` disables) |
-| `GGML_TQ_NATIVE`                          | unset   | CUDA: `1` keeps `TQ4_1S` weights native instead of converting them to `q8_0` at load |
-| `GGML_CUDA_FUSE_CHAIN`                    | unset   | CUDA: `0` disables elementwise chain fusion |
-| `GGML_CUDA_Q8CACHE`                       | unset   | CUDA: `0` disables the per-graph shared q8_1 activation cache in `mmvq` |
-| `LLAMA_ATTN_ROT_K_OVERRIDE` / `LLAMA_ATTN_ROT_V_OVERRIDE` | off | Enable optional upstream attention rotation for K / V (TurboQuant manages its own rotation) |
-| `LLAMA_ATTN_ROT_K_NROT`                   | `64`    | Rotation size for the optional upstream K path (`0` = upstream default) |
-| `LLAMA_ATTN_ROT_DISABLE`                  | `0`     | Hard lock-out: force rotation off on both sides (`1` disables) |
-
-This is a summary for users. [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md) is the source of truth for these variables; if the doc and the code ever disagree, the code wins and both need fixing in the same PR.
-
-## Common problems
-
-- `Unsupported cache type: turbo3`: you are running an upstream pre-built binary. Build this repository instead. The `ghcr.io/ggml-org/llama.cpp` images in [docs/docker.md](docs/docker.md) count as upstream binaries.
-- Crash or abort on the first turbo KV write (Metal NULL-pipeline deref, Vulkan SET_ROWS abort): stale binary; update to the latest fork build.
-- Abort in the Metal flash attention kernel with a turbo cache: the K/V pair is not one of turbo+turbo, `q8_0`+turbo or turbo+`q8_0` (turbo = `turbo2/3/4`). Use one of those, or an `f16` V cache with `f16` K.
-- NaN or garbage output with `TQ4_1S` weights on CUDA: the fused TQ kernels, which only `GGML_TQ_NATIVE=1` enters, had NaN bugs. Build a current fork revision and leave `GGML_TQ_NATIVE` unset; the default load-time `q8_0` conversion does not use them.
-- Output looks fluent but token probabilities changed: attention-sink model. Use `f16` K (not available with a turbo V cache on Metal) and compare with `llama-perplexity --kl-divergence` before blaming the codec.
-- `not supported [backend]` lines or `0/0 tests passed` in `test-backend-ops`: the cases for your change were skipped, not passed.
-
-## Scope and focus
-
-This fork is not a superset of upstream. Upstream tracks a very wide range of hardware, models and features; this fork keeps a narrower, curated focus:
-
-- **Backends**: the TurboQuant work is developed and tested for CPU, CUDA, HIP (AMD), Metal (Apple silicon), Vulkan and SYCL. Other upstream backends (CANN, MUSA, OpenCL, OpenVINO, ZenDNN, WebGPU, RPC, etc.) are inherited from the upstream base but are not a focus and receive no extra validation here.
-- **Models**: new model support is brought in from upstream when it adds benefit (for example attention shapes or GQA/MLA variants that exercise the turbo paths), not across the board.
-- **Features**: upstream changes are usually cherry-picked where they add benefit, and fork features (turbo cache types, TQ and ConvRot weight types) are where the extra kernel and test investment goes. There has been one wholesale upstream sync, `a34005435` (upstream `15586e2d7`, Aug 2026, PR #287); treat further bulk syncs as a decision to make deliberately, not a default.
-
-Plain C/C++ implementation on top of the [ggml](https://github.com/ggml-org/ggml) library, no external runtime dependencies; upstream build instructions still apply, see [docs/build.md](docs/build.md).
-
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md) (upstream images, no TurboQuant)
-- [KV cache quantization with TurboQuant](docs/KV-cache-quantization.md)
-- [SYCL backend](docs/backend/SYCL.md) (`turbo2/3/4` KV cache only, no TQ weights)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [Models](docs/models.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches and merge PRs
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-- **Fork development rules**: test gates, coverage limits, known pitfalls and the git sync workflow live in [AGENTS.md](AGENTS.md). Read it before touching quantization or backend code.
-- Issue triage: report TurboQuant-specific issues (turbo/TQ cache types, TQ weights, kernel crashes) in this repository; report general llama.cpp issues upstream.
-
-## License
-
-This project is licensed under [MIT](LICENSE), the same as upstream. All TurboQuant additions in this fork are under the same license.
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Third-party single-header libraries:
+[cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT),
+[stb-image](https://github.com/nothings/stb) (public domain),
+[nlohmann/json](https://github.com/nlohmann/json) (MIT),
+[miniaudio.h](https://github.com/mackron/miniaudio) (public domain),
+[subprocess.h](https://github.com/sheredom/subprocess.h) (public domain).

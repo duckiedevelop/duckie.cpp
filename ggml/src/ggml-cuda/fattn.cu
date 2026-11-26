@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-duckie.cuh"
 #include "convert.cuh"
 #include "kv-stream-span-tuner.h"
 
@@ -3485,6 +3486,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // duckie: GQA-packed split-KV decode kernel for quantized KV (falls through when not applicable)
+    if (ggml_cuda_flash_attn_ext_duckie(ctx, dst)) {
+        return;
+    }
 
     // Fused turbo MMA decode gate (DEFAULT ON, see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
     // Routes turbo2/3/4 K==V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed
