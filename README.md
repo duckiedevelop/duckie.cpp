@@ -139,7 +139,7 @@ RTX 4050 Laptop GPU (6 GB), Bonsai-27B `Q1_0`, `-ngl 99 -fa 1 -b 256 -ub 128`.
 
 | Context depth | Stock attention (`GGML_DUCKIE_FA=0`) | duckie attention | Gain |
 |--------------:|-------------------------------------:|-----------------:|-----:|
-| 0             | 30.2                                 | 29.2             | same (short context uses the stock path) |
+| 0             | 30.2                                 | 29.2             | tie (within run-to-run noise) |
 | 16k           | 21.7                                 | **28.2**         | +30% |
 | 32k           | 16.8                                 | **25.6**         | +52% |
 
