@@ -481,6 +481,12 @@ static fs::path backend_filename_extension() {
 }
 
 static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
+    // duckie: a backend compiled into this binary wins. Loading a ggml-<name>.dll lying next to the exe would pull a
+    // second, foreign ggml into the process (e.g. old release DLLs beside a static build -> GGML_ASSERT at startup).
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name(name)) {
+        return reg;
+    }
+
     // enumerate all the files that match [lib]ggml-name-*.[so|dll] in the search paths
     const fs::path name_path = fs::u8path(name);
     const fs::path file_prefix = backend_filename_prefix().native() + name_path.native() + fs::u8path("-").native();
