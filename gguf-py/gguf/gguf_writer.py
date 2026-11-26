@@ -978,6 +978,15 @@ class GGUFWriter:
     def add_selector_top_k(self, value: int) -> None:
         self.add_uint32(Keys.LLM.SELECTOR_TOP_K.format(arch=self.arch), value)
 
+    def add_log_snr_conditioning(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.LOG_SNR_CONDITIONING.format(arch=self.arch), value)
+
+    def add_min_log_snr(self, value: float) -> None:
+        self.add_float32(Keys.LLM.MIN_LOG_SNR.format(arch=self.arch), value)
+
+    def add_max_log_snr(self, value: float) -> None:
+        self.add_float32(Keys.LLM.MAX_LOG_SNR.format(arch=self.arch), value)
+
     def add_sample_from_anchor(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SAMPLE_FROM_ANCHOR.format(arch=self.arch), value)
 

@@ -138,6 +138,39 @@ public:
     const int64_t n_embd = 0;
 };
 
+// DSpark GIDD log-SNR conditioning: sinusoidal features of the per-position log-SNR,
+// projected by log_snr_fc1 -> SiLU -> log_snr_fc2 and added to the draft token embeddings
+constexpr int64_t LLM_DSPARK_LOG_SNR_N_FREQ = 128;
+
+// throws on invalid bounds, or when combined with the DSV4 hyper-connection backbone
+void llm_dspark_log_snr_validate(
+        bool    enabled,
+        int64_t dsv4_hc_mult,
+        float   min_log_snr,
+        float   max_log_snr);
+
+// [LLM_DSPARK_LOG_SNR_N_FREQ, n_tokens] row-major features; tokens must form n_blocks equal blocks
+std::vector<float> llm_dspark_log_snr_feat(
+        int64_t n_tokens,
+        int64_t n_blocks,
+        float   min_log_snr,
+        float   max_log_snr);
+
+class llm_graph_input_dspark_logsnr : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_logsnr(std::vector<float> feat, int64_t n_blocks) :
+        v_feat(std::move(feat)), n_blocks(n_blocks) {}
+    virtual ~llm_graph_input_dspark_logsnr() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * feat = nullptr; // F32 [LLM_DSPARK_LOG_SNR_N_FREQ, n_tokens]
+    std::vector<float> v_feat;
+    const int64_t n_blocks;
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:

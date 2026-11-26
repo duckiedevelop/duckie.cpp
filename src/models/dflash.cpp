@@ -34,6 +34,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     // DeepSeek-V4 DSpark backbone: stages are full DSV4 blocks, uniform sliding window (the draft KV ring)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
+
+    // DSpark GIDD log-SNR conditioning: bounds are mandatory once the key is set
+    ml.get_key(LLM_KV_LOG_SNR_CONDITIONING, hparams.dspark_log_snr_conditioning, false);
+    if (hparams.dspark_log_snr_conditioning) {
+        ml.get_key(LLM_KV_MIN_LOG_SNR, hparams.dspark_min_log_snr, true);
+        ml.get_key(LLM_KV_MAX_LOG_SNR, hparams.dspark_max_log_snr, true);
+    }
+    llm_dspark_log_snr_validate(
+            hparams.dspark_log_snr_conditioning,
+            hparams.dsv4_hc_mult,
+            hparams.dspark_min_log_snr,
+            hparams.dspark_max_log_snr);
+
     if (hparams.dsv4_hc_mult > 0) {
         ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
         ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
@@ -111,6 +124,17 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader & ml) {
         dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
 
         LLAMA_LOG_INFO("%s: DFlash with DSpark markov head (rank = %lld)\n", __func__, (long long) dspark_markov_rank);
+    }
+
+    // DSpark GIDD log-SNR conditioning: 2-layer MLP over sinusoidal log-SNR features
+    if (hparams.dspark_log_snr_conditioning) {
+        dspark_log_snr_fc1_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "weight"), { LLM_DSPARK_LOG_SNR_N_FREQ, n_embd }, 0);
+        dspark_log_snr_fc1_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC1, "bias"),   { n_embd },                            0);
+        dspark_log_snr_fc2_w = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "weight"), { n_embd, n_embd },                    0);
+        dspark_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "bias"),   { n_embd },                            0);
+
+        LLAMA_LOG_INFO("%s: DFlash with DSpark log-SNR conditioning (min %.3f, max %.3f)\n",
+                __func__, (double) hparams.dspark_min_log_snr, (double) hparams.dspark_max_log_snr);
     }
 
     const struct ggml_tensor * selector_meta = ml.get_tensor_meta("selector_hidden.weight");
@@ -686,6 +710,38 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
+
+    // DSpark GIDD log-SNR conditioning: anchors at max log-SNR, drafted positions at min log-SNR,
+    // embedded as fc2(silu(fc1(sinusoid(log_snr)))) and added to the noise-block embeddings
+    if (hparams.dspark_log_snr_conditioning) {
+        GGML_ASSERT(model.dspark_log_snr_fc1_w && model.dspark_log_snr_fc1_b &&
+                    model.dspark_log_snr_fc2_w && model.dspark_log_snr_fc2_b &&
+                    "DSpark log-SNR conditioning weights not loaded");
+
+        const int64_t n_blocks = ubatch.n_seqs_unq;
+        std::vector<float> feat = llm_dspark_log_snr_feat(
+                n_tokens, n_blocks, hparams.dspark_min_log_snr, hparams.dspark_max_log_snr);
+
+        auto inp_snr = std::make_unique<llm_graph_input_dspark_logsnr>(std::move(feat), n_blocks);
+        inp_snr->feat = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, LLM_DSPARK_LOG_SNR_N_FREQ, n_tokens);
+        ggml_set_input(inp_snr->feat);
+        ggml_set_name(inp_snr->feat, "dspark_log_snr_feat");
+
+        ggml_tensor * snr_feat = inp_snr->feat;
+        res->add_input(std::move(inp_snr));
+
+        ggml_tensor * snr_hidden = build_lora_mm(model.dspark_log_snr_fc1_w, snr_feat);
+        snr_hidden = ggml_add(ctx0, snr_hidden, model.dspark_log_snr_fc1_b);
+        snr_hidden = ggml_silu(ctx0, snr_hidden);
+        cb(snr_hidden, "dspark_log_snr_fc1", -1);
+
+        ggml_tensor * snr_embd = build_lora_mm(model.dspark_log_snr_fc2_w, snr_hidden);
+        snr_embd = ggml_add(ctx0, snr_embd, model.dspark_log_snr_fc2_b);
+        cb(snr_embd, "dspark_log_snr_fc2", -1);
+
+        inpL = ggml_add(ctx0, inpL, snr_embd);
+        cb(inpL, "dspark_draft_embd_snr", -1);
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
